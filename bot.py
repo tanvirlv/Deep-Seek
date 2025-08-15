@@ -19,7 +19,7 @@ logging.basicConfig(
     level=logging.INFO,
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bot.log", encoding='utf-8')  # Proper file handling
+        logging.FileHandler("bot.log", encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ class BotConfig:
         
     def validate(self) -> None:
         """Strict validation for credentials"""
-        if not self.bot_token or not self.bot_token.startswith(''):
+        if not self.bot_token or len(self.bot_token) < 30:
             raise ValueError("Invalid BOT_TOKEN format")
             
         if not self.api_key or not (
@@ -106,6 +106,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True
     )
 
+# ADDED MISSING HELPER COMMAND FUNCTION
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detailed help message with formatting"""
+    help_text = (
+        "🆘 *Bot Help Guide*\n\n"
+        "🔹 *Basic Usage:*\n"
+        "- Just send me a message and I'll respond\n"
+        "- Max length: {} characters\n\n"
+        "🔹 *Examples:*\n"
+        "• `/start` - Show welcome message\n"
+        "• `Explain photosynthesis` - Get a detailed explanation\n"
+        "• `Write Python code for a todo app` - Generate functional code\n\n"
+        "🔹 *Limits:*\n"
+        "- Rate limit: 1 request every {} seconds\n"
+        "- No file/image support (text only)"
+    ).format(MAX_INPUT_LENGTH, REQUEST_COOLDOWN.seconds)
+
+    await update.message.reply_text(
+        help_text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Robust message handler with full error protection"""
     user = update.effective_user
@@ -168,13 +191,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     except HTTPStatusError as e:
+        status_code = e.response.status_code
         error_msg = {
             401: "🔐 API authentication failed - check your API key",
             429: "⚠️ Too many requests - please wait before trying again",
             500: "🔧 API server error - try again later"
-        }.get(e.response.status_code, f"API Error {e.response.status_code}")
+        }.get(status_code, f"API Error {status_code}")
         
-        logger.error(f"API Error for {user.id}: {str(e)}")
+        logger.error(f"API Error for {user.id}: {status_code}")
         await message.reply_text(error_msg)
 
     except Exception as e:
@@ -208,7 +232,7 @@ def setup_application() -> Application:
     # Register handlers
     app.add_handlers([
         CommandHandler("start", start),
-        CommandHandler("help", help_command),
+        CommandHandler("help", help_command),  # Now properly defined
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             handle_message
