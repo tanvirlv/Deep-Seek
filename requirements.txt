@@ -1,7 +1,4 @@
-# Core
 python-telegram-bot==20.3
-httpx==0.25.0
+httpx==0.24.0  # Downgraded to match python-telegram-bot's requirement
 httpcore==0.17.3
-
-# Optional
 python-dotenv==1.0.0
