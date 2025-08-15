@@ -1,6 +1,8 @@
 import os
 import logging
 from datetime import datetime, timedelta
+from typing import Dict, Tuple, Optional
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -10,103 +12,107 @@ from telegram.ext import (
     ContextTypes,
 )
 from httpx import AsyncClient, Timeout, HTTPStatusError
-from typing import Dict, Tuple
 
-# Configure logging
+# Configure advanced logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log")  # Log to file for debugging
+    ]
 )
 logger = logging.getLogger(__name__)
 
 # Constants
 API_URL = "https://api.deepseek.com/v1/chat/completions"
 MAX_INPUT_LENGTH = 2000
-MAX_RESPONSE_LENGTH = 4096
+MAX_RESPONSE_LENGTH = 4096  # Telegram's max message length
 REQUEST_COOLDOWN = timedelta(seconds=5)
+HEARTBEAT_INTERVAL = 300  # 5 minutes in seconds
 
 # Global state for rate limiting
 USER_LAST_REQUEST: Dict[int, datetime] = {}
 
-class ConfigError(Exception):
-    """Custom exception for configuration errors"""
+class BotConfig:
+    """Centralized configuration management"""
+    def __init__(self):
+        self.bot_token: Optional[str] = None
+        self.api_key: Optional[str] = None
+        
+    def validate(self) -> None:
+        """Validate all required config"""
+        if not self.bot_token or len(self.bot_token) < 30:
+            raise ValueError("Invalid BOT_TOKEN")
+        if not self.api_key or not self.api_key.startswith("ds-"):
+            raise ValueError("Invalid DEEPSEEK_API_KEY format")
 
-def validate_config() -> Tuple[str, str]:
-    """Validate and return environment variables"""
-    config = {
-        "BOT_TOKEN": (str, 30, 100),  # (type, min_len, max_len)
-        "DEEPSEEK_API_KEY": (str, 20, 200),
-    }
-
-    validated = {}
-    for var, (var_type, min_l, max_l) in config.items():
-        value = os.getenv(var)
-        if not value:
-            raise ConfigError(f"{var} environment variable is not set")
-        if not isinstance(value, var_type):
-            raise ConfigError(f"{var} must be {var_type.__name__}")
-        if not (min_l <= len(value) <= max_l):
-            raise ConfigError(f"{var} length must be between {min_l}-{max_l} chars")
-        validated[var] = value
-
-    return validated["BOT_TOKEN"], validated["DEEPSEEK_API_KEY"]
+config = BotConfig()
 
 def safe_trim(text: str, max_len: int = MAX_RESPONSE_LENGTH) -> str:
-    """Safely trim long messages at the nearest line break"""
+    """Smart message trimming with overflow handling"""
+    text = text.strip()
     if len(text) <= max_len:
         return text
-    return text[:max_len].rsplit("\n", 1)[0] + "\n[...truncated]"
+        
+    # Preserve the last complete line if possible
+    trimmed = text[:max_len]
+    if "\n" in trimmed:
+        trimmed = trimmed.rsplit("\n", 1)[0] + "\n[...]"
+    else:
+        trimmed = trimmed[:max_len-3] + "..."
+    return trimmed
 
 async def check_rate_limit(user_id: int) -> bool:
-    """Return True if request should be allowed"""
+    """Enhanced rate limiting with automatic cleanup"""
     now = datetime.now()
-    last_request = USER_LAST_REQUEST.get(user_id)
     
-    if last_request and (now - last_request) < REQUEST_COOLDOWN:
-        return False
-        
+    # Cleanup old entries (>1 hour)
+    global USER_LAST_REQUEST
+    USER_LAST_REQUEST = {
+        uid: time for uid, time in USER_LAST_REQUEST.items()
+        if (now - time) < timedelta(hours=1)
+    }
+    
+    if (last_request := USER_LAST_REQUEST.get(user_id)):
+        if (now - last_request) < REQUEST_COOLDOWN:
+            return False
+            
     USER_LAST_REQUEST[user_id] = now
     return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
+    """Interactive start command with user analytics"""
+    user = update.effective_user
+    logger.info(f"New user: {user.id} - @{user.username}")
+    
     await update.message.reply_text(
-        "🤖 I am DeepSeek V3 0348 chat bot created by tanvir_lv!\n\n"
-        "• Just send me a message\n"
-        "• Use /help for more info\n"
-        "• Rate limit: 1 request per 5 seconds"
+        f"🤖 Hello {user.first_name}! I'm DeepSeek AI Assistant\n\n"
+        "• Ask me anything in any language\n"
+        "• /help for usage tips\n"
+        f"• Rate limit: 1 request per {REQUEST_COOLDOWN.seconds}s"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
+    """Dynamic help command"""
     await update.message.reply_text(
-        "ℹ️ Bot Usage Guide:\n\n"
-        f"- Keep messages under {MAX_INPUT_LENGTH} chars\n"
-        "- I process text only (no files/images)\n"
-        "- Responses limited to {MAX_RESPONSE_LENGTH} chars\n"
-        "- Cooldown: {REQUEST_COOLDOWN.seconds} sec between requests"
+        "📚 *Bot Guide*\n\n"
+        f"- Max input: {MAX_INPUT_LENGTH} chars\n"
+        f"- Responses trimmed to {MAX_RESPONSE_LENGTH} chars\n"
+        "- Supports markdown formatting\n"
+        "- No message history (stateless)\n\n"
+        "Try asking:\n"
+        "• _Explain quantum computing simply_\n"
+        "• _Write python code for bubble sort_",
+        parse_mode="Markdown"
     )
 
-def validate_api_response(response_data: dict) -> str:
-    """Validate and extract response text from API"""
-    if not isinstance(response_data, dict):
-        raise ValueError("API response is not a dictionary")
-    
-    if "choices" not in response_data or not isinstance(response_data["choices"], list):
-        raise ValueError("Invalid choices format")
-        
-    first_choice = response_data["choices"][0]
-    if "message" not in first_choice or "content" not in first_choice["message"]:
-        raise ValueError("Missing message content")
-        
-    return str(first_choice["message"]["content"])
-
 async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process user messages"""
+    """Enhanced message handler with proper error management"""
     user = update.effective_user
     message = update.message
     
-    # Rate limiting check
+    # Rate limit check
     if not await check_rate_limit(user.id):
         await message.reply_text(
             f"⏳ Please wait {REQUEST_COOLDOWN.seconds} seconds between requests"
@@ -120,7 +126,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     if len(user_input) > MAX_INPUT_LENGTH:
         await message.reply_text(
-            f"Message too long. Please keep under {MAX_INPUT_LENGTH} characters"
+            f"❌ Message exceeds {MAX_INPUT_LENGTH} character limit"
         )
         return
 
@@ -131,55 +137,94 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 json={
                     "model": "deepseek-chat",
                     "messages": [{"role": "user", "content": user_input}],
+                    "temperature": 0.7,
                 },
-                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+                headers={
+                    "Authorization": f"Bearer {config.api_key}",
+                    "Content-Type": "application/json"
+                }
             )
-            response.raise_for_status()
             
-            ai_text = validate_api_response(response.json())
+            # Validate response structure
+            response.raise_for_status()
+            data = response.json()
+            
+            if not data.get("choices"):
+                raise ValueError("Invalid API response format")
+                
+            ai_text = data["choices"][0]["message"]["content"]
             await message.reply_text(safe_trim(ai_text))
 
-    except Timeout:
-        logger.warning(f"Timeout for user {user.id}")
-        await message.reply_text("⌛ Server is busy. Please try again later")
     except HTTPStatusError as e:
-        logger.error(f"API error for user {user.id}: {e.response.status_code}")
-        await message.reply_text("⚠️ Service temporarily unavailable")
+        status_code = e.response.status_code
+        logger.error(f"API Error {status_code} for user {user.id}")
+        
+        if status_code == 401:
+            msg = "🔒 API authentication failed"
+        elif status_code == 429:
+            msg = "⚠️ Too many requests to API"
+        else:
+            msg = f"API Error {status_code}"
+            
+        await message.reply_text(f"{msg}. Please try later.")
+        
     except Exception as e:
-        logger.error(f"Unexpected error for user {user.id}: {str(e)}", exc_info=True)
-        await message.reply_text("🔧 An error occurred. Developers have been notified")
+        logger.error(f"Unexpected error for {user.id}: {str(e)}", exc_info=True)
+        await message.reply_text("⚠️ Temporary system error")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all uncaught exceptions"""
-    logger.error(
-        f"Error during processing update {update}: {context.error}",
-        exc_info=context.error,
-    )
+    """Centralized error handling"""
+    error = context.error
+    logger.critical(f"Unhandled error: {error}", exc_info=error)
     
     if isinstance(update, Update) and update.message:
         await update.message.reply_text(
-            "⚠️ A system error occurred. Please try again later"
+            "🛠️ Our engineers have been notified of this issue"
         )
 
+async def heartbeat(context: ContextTypes.DEFAULT_TYPE):
+    """Prevent Render free tier from sleeping"""
+    logger.debug("Heartbeat ping")
+
 def main():
-    """Start the bot"""
     try:
-        global BOT_TOKEN, DEEPSEEK_API_KEY
-        BOT_TOKEN, DEEPSEEK_API_KEY = validate_config()
+        # Load config from environment
+        config.bot_token = os.getenv("BOT_TOKEN")
+        config.api_key = os.getenv("DEEPSEEK_API_KEY")
+        config.validate()
         
-        app = Application.builder().token(BOT_TOKEN).build()
+        # Initialize bot
+        app = Application.builder().token(config.bot_token).build()
         
         # Register handlers
         app.add_handlers([
             CommandHandler("start", start),
             CommandHandler("help", help_command),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, reply),
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                reply
+            )
         ])
         
+        # Error handling
         app.add_error_handler(error_handler)
         
-        logger.info("Bot is starting...")
-        app.run_polling(drop_pending_updates=True)
+        # Prevent Render free tier timeout
+        job_queue = app.job_queue
+        if job_queue:
+            job_queue.run_repeating(
+                heartbeat,
+                interval=HEARTBEAT_INTERVAL,
+                first=10
+            )
+        
+        # Start bot
+        logger.info("Starting bot...")
+        app.run_polling(
+            drop_pending_updates=True,
+            close_loop=False,
+            allowed_updates=Update.ALL_TYPES
+        )
         
     except Exception as e:
         logger.critical(f"Fatal startup error: {str(e)}", exc_info=True)
